@@ -1,12 +1,12 @@
 package goheatshrink
 
 import (
-	"encoding/hex"
-	"fmt"
-	"log"
 	"bytes"
-	"io"
+	"encoding/hex"
 	"errors"
+	"fmt"
+	"io"
+	"log"
 )
 
 type Decoder interface {
@@ -19,7 +19,7 @@ type decoder struct {
 	outputCount int
 	outputIndex int
 	headIndex   int
-	state decodeState
+	state       decodeState
 	current     byte
 	bitIndex    byte
 
@@ -50,7 +50,7 @@ func NewDecoder(window uint8, lookahead uint8) Decoder {
 func (d *decoder) Decode(in []byte) ([]byte, error) {
 	var out []byte
 	ow := bytes.NewBuffer(out)
-	chunkSize := 1<< d.window
+	chunkSize := 1 << d.window
 	s := len(in)
 	for {
 		if s == 0 {
@@ -95,8 +95,6 @@ func (d *decoder) decodeRead(in []byte, out io.Writer) error {
 	return errors.New("Ran out of input before finishing")
 }
 
-
-
 func (d *decoder) sink(in []byte) int {
 	l("-- sinking %d bytes\n", len(in))
 	l("buffer: %v", hex.EncodeToString(in))
@@ -105,7 +103,7 @@ func (d *decoder) sink(in []byte) int {
 	return d.inputSize
 }
 
-func logState(s decodeState) string {
+func logDecodeState(s decodeState) string {
 	switch s {
 	case decodeStateTagBit:
 		return fmt.Sprintf("%d (tag_bit)", s)
@@ -136,7 +134,7 @@ func (d *decoder) poll(out []byte) (error, int, bool) {
 	}
 
 	for {
-		l("-- poll, state is %v, input_size %d\n", logState(d.state), d.inputSize)
+		l("-- poll, state is %v, input_size %d\n", logDecodeState(d.state), d.inputSize)
 		state := d.state
 		switch state {
 		case decodeStateTagBit:
@@ -208,7 +206,7 @@ func (d *decoder) stateYieldLiteral(oi *outputInfo) decodeState {
 func (d *decoder) stateBackRefIndexMSB() decodeState {
 	bitCount := d.window
 	bits := d.getBits(bitCount - 8)
-	l("-- backref index (msb), got 0x%04x (+1)\n", bits);
+	l("-- backref index (msb), got 0x%04x (+1)\n", bits)
 	if bits == NOBITS {
 		return decodeStateBackRefIndexMSB
 	}
@@ -224,7 +222,7 @@ func (d *decoder) stateBackRefIndexLSB() decodeState {
 	} else {
 		bits = d.getBits(8)
 	}
-	l("-- backref index (lsb), got 0x%04x (+1)\n", bits);
+	l("-- backref index (lsb), got 0x%04x (+1)\n", bits)
 	if bits == NOBITS {
 		return decodeStateBackRefIndexLSB
 	}
@@ -241,7 +239,7 @@ func (d *decoder) stateBackRefIndexLSB() decodeState {
 func (d *decoder) stateBackRefCountMSB() decodeState {
 	backRefBitCount := d.lookahead
 	bits := d.getBits(backRefBitCount - 8)
-	l("-- backref count (msb), got 0x%04x (+1)\n", bits);
+	l("-- backref count (msb), got 0x%04x (+1)\n", bits)
 	if bits == NOBITS {
 		return decodeStateBackRefCountMSB
 	}
@@ -257,7 +255,7 @@ func (d *decoder) stateBackRefCountLSB() decodeState {
 	} else {
 		bits = d.getBits(8)
 	}
-	l("-- backref count (lsb), got 0x%04x (+1)\n", bits);
+	l("-- backref count (lsb), got 0x%04x (+1)\n", bits)
 	if bits == NOBITS {
 		return decodeStateBackRefCountLSB
 	}

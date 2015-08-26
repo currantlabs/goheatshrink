@@ -1,6 +1,6 @@
 package goheatshrink
 
-//go:generate stringer -type=DecodeState
+//go:generate stringer -type=decodeState
 
 type decodeState int
 
@@ -12,5 +12,4 @@ const (
 	decodeStateBackRefCountMSB
 	decodeStateBackRefCountLSB
 	decodeStateYieldBackRef
-
 )
