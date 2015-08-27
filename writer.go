@@ -1,13 +1,12 @@
 package goheatshrink
 
 import (
+	"bufio"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log"
-
-	"github.com/go-errors/errors"
-	"bufio"
 )
 
 type writer interface {
@@ -15,7 +14,7 @@ type writer interface {
 	Flush() error
 }
 
-type Encoder struct {
+type Writer struct {
 	inputSize         int
 	matchScanIndex    int
 	matchLength       int
@@ -32,21 +31,21 @@ type Encoder struct {
 	lookahead uint8
 	index     []int16
 
-	w writer
+	w           writer
 	outputTotal int
 }
 
 const heatshrinkLiteralMarker byte = 0x01
 const heatshrinkBackrefMarker byte = 0x00
 
-func NewWriter(w io.Writer, window uint8, lookahead uint8) *Encoder {
+func NewWriter(w io.Writer, window uint8, lookahead uint8) *Writer {
 	bufSize := 2 << window
 	bw, ok := w.(writer)
 	if !ok {
 		bw = bufio.NewWriter(w)
 	}
-	return &Encoder{
-		w: bw,
+	return &Writer{
+		w:        bw,
 		state:    encodeStateNotFull,
 		bitIndex: 0x80,
 
@@ -57,13 +56,13 @@ func NewWriter(w io.Writer, window uint8, lookahead uint8) *Encoder {
 	}
 }
 
-func (e *Encoder) Write(p []byte) (n int, err error) {
+func (w *Writer) Write(p []byte) (n int, err error) {
 	l("Writing %v bytes\n", len(p))
 	var done int
 	total := len(p)
 	for {
 		if len(p) > 0 {
-			inputSize, err := e.sink(p)
+			inputSize, err := w.sink(p)
 			done += int(inputSize)
 			if err != nil {
 				return done, err
@@ -71,15 +70,14 @@ func (e *Encoder) Write(p []byte) (n int, err error) {
 			p = p[inputSize:]
 		}
 
-		outputSize, err, notFull := e.poll()
+		outputSize, err, notFull := w.poll()
 		l("Poll: %v %v %v %v/%v\n", outputSize, err, notFull, done, total)
 		if err != nil {
 			return done, err
 		}
 
-
 		if outputSize == 0 {
-			if e.finish() {
+			if w.finish() {
 				return done, nil
 			}
 		}
@@ -93,32 +91,31 @@ func (e *Encoder) Write(p []byte) (n int, err error) {
 	return done, nil
 }
 
-func (e *Encoder) Close() error {
-	if e.finish() {
+func (w *Writer) Close() error {
+	if w.finish() {
 		return nil
 	}
-	_, err, _ := e.poll()
+	_, err, _ := w.poll()
 	if err != nil {
 		return err
 	}
-	if e.finish() {
+	if w.finish() {
 		return nil
 	}
 	return errors.New("unable to finish")
 }
 
-
-func (e *Encoder) sink(in []byte) (int, error) {
-	if e.isFinishing() {
+func (w *Writer) sink(in []byte) (int, error) {
+	if w.isFinishing() {
 		return 0, errors.New("sinking while finishing")
 	}
-	if e.state != encodeStateNotFull {
+	if w.state != encodeStateNotFull {
 		return 0, errors.New("sinking while processing")
 	}
-	l("-- sinking %d bytes; inputSize %v\n", len(in), e.inputSize)
-	offset := e.getInputBufferSize() + e.inputSize
-	ibs := e.getInputBufferSize()
-	remaining := ibs - e.inputSize
+	l("-- sinking %d bytes; inputSize %v\n", len(in), w.inputSize)
+	offset := w.getInputBufferSize() + w.inputSize
+	ibs := w.getInputBufferSize()
+	remaining := ibs - w.inputSize
 	l("-- remaining %v\n", remaining)
 	var copySize int
 	if remaining < len(in) {
@@ -129,15 +126,15 @@ func (e *Encoder) sink(in []byte) (int, error) {
 		copySize = len(in)
 	}
 	l("-- copySize %v\n", copySize)
-	copy(e.buffer[offset:], in[:copySize])
-	e.inputSize += copySize
+	copy(w.buffer[offset:], in[:copySize])
+	w.inputSize += copySize
 	l("-- sunk %d bytes (of %d) into encoder at %d, input buffer now has %d\n",
-		copySize, len(in), offset, e.inputSize)
-	l("buffer: %v", hex.EncodeToString(e.buffer[:e.inputSize]))
-	l("buffer: %v", hex.EncodeToString(e.buffer[e.getInputBufferSize():]))
+		copySize, len(in), offset, w.inputSize)
+	l("buffer: %v", hex.EncodeToString(w.buffer[:w.inputSize]))
+	l("buffer: %v", hex.EncodeToString(w.buffer[w.getInputBufferSize():]))
 	if copySize == remaining {
 		l("-- internal buffer is now full\n")
-		e.state = encodeStateFilled
+		w.state = encodeStateFilled
 	}
 	return copySize, nil
 }
@@ -170,107 +167,98 @@ func logEncodeState(s encodeState) string {
 	return fmt.Sprintf("%d", s)
 }
 
-type encodePollResult int
+func (w *Writer) poll() (int, error, bool) {
 
-const (
-	encodePollResultEmpty encodePollResult = iota
-	encodePollResultMore
-	encodePollResultErrorNull
-	encodePollResultErrorMisuse
-)
-
-func (e *Encoder) poll() (int, error, bool) {
-
-	e.outputTotal = 0
+	w.outputTotal = 0
 	var err error
 
 	for {
-		l("-- polling, state %v, flags 0x%02x\n", logEncodeState(e.state), e.flags)
-		state := e.state
+		l("-- polling, state %v, flags 0x%02x\n", logEncodeState(w.state), w.flags)
+		state := w.state
 		switch state {
 		case encodeStateNotFull:
-			return e.outputTotal, nil, true
+			return w.outputTotal, nil, true
 		case encodeStateFilled:
-			e.doIndexing()
-			e.state = encodeStateSearch
+			w.doIndexing()
+			w.state = encodeStateSearch
 		case encodeStateSearch:
-			e.state = e.stateStepSearch()
+			w.state = w.stateStepSearch()
 		case encodeStateYieldTagBit:
-			e.state, err = e.stateYieldTagBit()
+			w.state, err = w.stateYieldTagBit()
 		case encodeStateYieldLiteral:
-			e.state, err = e.stateYieldLiteral()
+			w.state, err = w.stateYieldLiteral()
 		case encodeStateYieldBackRefIndex:
-			e.state, err = e.stateYieldBackRefIndex()
+			w.state, err = w.stateYieldBackRefIndex()
 		case encodeStateYieldBackRefLength:
-			e.state, err = e.stateYieldBackRefLength()
+			w.state, err = w.stateYieldBackRefLength()
 		case encodeStateSaveBacklog:
-			e.state = e.stateSaveBacklog()
+			w.state = w.stateSaveBacklog()
 		case encodeStateFlushBits:
-			e.state, err = e.stateFlushBitBuffer()
+			w.state, err = w.stateFlushBitBuffer()
 		case encodeStateDone:
-			return e.outputTotal, nil, false
+			return w.outputTotal, nil, false
 		case encodeStateInvalid:
 			log.Fatal("Invalid state: %v", state)
 		default:
 			log.Fatal("Unknown state: %v", state)
 		}
 		if err != nil {
-			return e.outputTotal, err, false
+			return w.outputTotal, err, false
 		}
 
 	}
 
 }
 
-func (e *Encoder) finish() bool {
+func (w *Writer) finish() bool {
 	l("-- setting is_finishing flag\n")
-	e.flags |= encodeFlagsFinishing
-	if e.state == encodeStateNotFull {
-		e.state = encodeStateFilled
+	w.flags |= encodeFlagsFinishing
+	if w.state == encodeStateNotFull {
+		w.state = encodeStateFilled
 	}
-	return e.state == encodeStateDone
+	return w.state == encodeStateDone
 }
 
-func (e *Encoder) stateStepSearch() encodeState {
-	var windowLength int = 1 << e.window
-	var lookaheadLength int = 1 << e.lookahead
-	msi := e.matchScanIndex
+func (w *Writer) stateStepSearch() encodeState {
+	var windowLength int = 1 << w.window
+	var lookaheadLength int = 1 << w.lookahead
+	msi := w.matchScanIndex
 	l("## step_search, scan @ +%d (%d/%d), input size %d\n",
-		msi, e.inputSize+msi, 2*windowLength, e.inputSize)
-	fin := e.isFinishing()
+		msi, w.inputSize+msi, 2*windowLength, w.inputSize)
+	fin := w.isFinishing()
 	var lookaheadCompare int
 	if fin {
 		lookaheadCompare = 1
 	} else {
 		lookaheadCompare = lookaheadLength
 	}
-	if msi > e.inputSize-lookaheadCompare {
+	if msi > w.inputSize-lookaheadCompare {
 		l("-- end of search @ %d\n", msi)
 		if fin {
 			return encodeStateFlushBits
 		}
 		return encodeStateSaveBacklog
 	}
-	ibs := e.getInputBufferSize()
+	ibs := w.getInputBufferSize()
 	end := ibs + msi
 	start := end - windowLength
 	maxPossible := lookaheadLength
-	if e.inputSize-msi < lookaheadLength {
-		maxPossible = e.inputSize - msi
+	if w.inputSize-msi < lookaheadLength {
+		maxPossible = w.inputSize - msi
 	}
-	matchPos, matchLength := e.findLongestMatch(start, end, maxPossible)
+	matchPos, matchLength := w.findLongestMatch(start, end, maxPossible)
 	if matchPos == matchNotFound {
 		l("ss Match not found\n")
-		e.matchScanIndex++
-		e.matchLength = 0
+		w.matchScanIndex++
+		w.matchLength = 0
 		return encodeStateYieldTagBit
 	}
 	l("ss Found match of %d bytes at %d\n", matchLength, matchPos)
-	e.matchPosition = matchPos
-	e.matchLength = matchLength
-	l("ss 1 << HEATSHRINK_ENCODER_WINDOW_BITS(hse) %d\n", 1<<e.window)
+	w.matchPosition = matchPos
+	w.matchLength = matchLength
+	l("ss 1 << HEATSHRINK_ENCODER_WINDOW_BITS(hse) %d\n", 1<<w.window)
 	l("ss match_pos %d\n", matchPos)
-	if matchPos < (1 << e.window) {
+	if matchPos < (1 << w.window) {
 		l("ss match_pos < (1 << HEATSHRINK_ENCODER_WINDOW_BITS(hse)) 1\n")
 	} else {
 		l("ss match_pos < (1 << HEATSHRINK_ENCODER_WINDOW_BITS(hse)) 0\n")
@@ -279,99 +267,99 @@ func (e *Encoder) stateStepSearch() encodeState {
 	return encodeStateYieldTagBit
 }
 
-func (e *Encoder) stateYieldTagBit() (encodeState, error) {
-	if e.matchLength == 0 {
-		err := e.addTagBit(heatshrinkLiteralMarker)
+func (w *Writer) stateYieldTagBit() (encodeState, error) {
+	if w.matchLength == 0 {
+		err := w.addTagBit(heatshrinkLiteralMarker)
 		if err != nil {
 			return encodeStateInvalid, err
 		}
 		return encodeStateYieldLiteral, nil
 	}
-	err := e.addTagBit(heatshrinkBackrefMarker)
+	err := w.addTagBit(heatshrinkBackrefMarker)
 	if err != nil {
 		return encodeStateInvalid, err
 	}
-	e.outgoingBits = e.matchPosition - 1
-	e.outgoingBitsCount = e.window
+	w.outgoingBits = w.matchPosition - 1
+	w.outgoingBitsCount = w.window
 	return encodeStateYieldBackRefIndex, nil
 }
 
-func (e *Encoder) stateYieldLiteral() (encodeState, error) {
-	err := e.pushLiteralByte()
+func (w *Writer) stateYieldLiteral() (encodeState, error) {
+	err := w.pushLiteralByte()
 	if err != nil {
 		return encodeStateInvalid, err
 	}
 	return encodeStateSearch, nil
 }
 
-func (e *Encoder) stateYieldBackRefIndex() (encodeState, error) {
-	l("-- yielding backref index %d\n", e.matchPosition)
-	count, err := e.pushOutgoingBits()
+func (w *Writer) stateYieldBackRefIndex() (encodeState, error) {
+	l("-- yielding backref index %d\n", w.matchPosition)
+	count, err := w.pushOutgoingBits()
 	if err != nil {
 		return encodeStateInvalid, err
 	}
 	if count > 0 {
 		return encodeStateYieldBackRefIndex, nil
 	}
-	e.outgoingBits = e.matchLength - 1
-	e.outgoingBitsCount = e.lookahead
+	w.outgoingBits = w.matchLength - 1
+	w.outgoingBitsCount = w.lookahead
 	return encodeStateYieldBackRefLength, nil
 }
 
-func (e *Encoder) stateYieldBackRefLength() (encodeState, error) {
-	l("-- yielding backref length %d\n", e.matchLength)
-	count, err := e.pushOutgoingBits()
+func (w *Writer) stateYieldBackRefLength() (encodeState, error) {
+	l("-- yielding backref length %d\n", w.matchLength)
+	count, err := w.pushOutgoingBits()
 	if err != nil {
 		return encodeStateInvalid, err
 	}
 	if count > 0 {
 		return encodeStateYieldBackRefLength, nil
 	}
-	e.matchScanIndex += e.matchLength
-	e.matchLength = 0
+	w.matchScanIndex += w.matchLength
+	w.matchLength = 0
 	return encodeStateSearch, nil
 }
 
-func (e *Encoder) stateSaveBacklog() encodeState {
+func (w *Writer) stateSaveBacklog() encodeState {
 	l("-- saving backlog\n")
-	e.saveBacklog()
+	w.saveBacklog()
 	return encodeStateNotFull
 }
 
-func (e *Encoder) stateFlushBitBuffer() (encodeState, error) {
-	if e.bitIndex == 0x80 {
+func (w *Writer) stateFlushBitBuffer() (encodeState, error) {
+	if w.bitIndex == 0x80 {
 		l("-- done!\n")
 		return encodeStateDone, nil
 	}
-	l("-- flushing remaining byte (bit_index == 0x%02x)\n", e.bitIndex)
-	err := e.w.WriteByte(e.current)
+	l("-- flushing remaining byte (bit_index == 0x%02x)\n", w.bitIndex)
+	err := w.w.WriteByte(w.current)
 	if err != nil {
 		l("-- error flushing: %v\n", err)
 		return encodeStateInvalid, err
 	}
-	e.outputTotal++
+	w.outputTotal++
 	l("-- done!\n")
 	return encodeStateDone, nil
 }
 
 const matchNotFound = ^int(0)
 
-func (e *Encoder) findLongestMatch(start int, end int, max int) (int, int) {
+func (w *Writer) findLongestMatch(start int, end int, max int) (int, int) {
 	l("-- scanning for match of buf[%d:%d] between buf[%d:%d] (max %d bytes)\n",
 		end, end+max, start, end+max-1, max)
 	var matchMaxLength int
 	var matchIndex = matchNotFound
 	var len int
-	needlepoint := e.buffer[end:]
-	pos := e.index[end]
+	needlepoint := w.buffer[end:]
+	pos := w.index[end]
 	l("pos: %d\n", pos)
 
 	for pos-int16(start) >= 0 {
-		pospoint := e.buffer[pos:]
+		pospoint := w.buffer[pos:]
 		len = 0
 		l("  --> cmp buf[%d] == 0x%02x against %02x (start %d)\n", pos+int16(len), pospoint[len], needlepoint[len], start)
 		if pospoint[matchMaxLength] != needlepoint[matchMaxLength] {
-			pos = e.index[pos]
+			pos = w.index[pos]
 			continue
 		}
 		for len = 1; len < max; len++ {
@@ -386,9 +374,9 @@ func (e *Encoder) findLongestMatch(start int, end int, max int) (int, int) {
 				break
 			}
 		}
-		pos = e.index[pos]
+		pos = w.index[pos]
 	}
-	breakEven := 1 + e.window + e.lookahead
+	breakEven := 1 + w.window + w.lookahead
 	if 8*uint(matchMaxLength) > uint(breakEven) {
 		l("-- best match: %d bytes at -%d\n", matchMaxLength, end-matchIndex)
 		return end - matchIndex, matchMaxLength
@@ -397,25 +385,25 @@ func (e *Encoder) findLongestMatch(start int, end int, max int) (int, int) {
 	return matchNotFound, 0
 }
 
-func (e *Encoder) pushLiteralByte() error {
-	processedOffset := e.matchScanIndex - 1
-	inputOffset := e.getInputBufferSize() + processedOffset
+func (w *Writer) pushLiteralByte() error {
+	processedOffset := w.matchScanIndex - 1
+	inputOffset := w.getInputBufferSize() + processedOffset
 
-	b := e.buffer[inputOffset]
+	b := w.buffer[inputOffset]
 	if isPrint(b) {
 		l("-- yielded literal byte 0x%02x ('%c') from +%d\n", b, b, inputOffset)
 	} else {
 		l("-- yielded literal byte 0x%02x ('.') from +%d\n", b, inputOffset)
 	}
-	return e.pushBits(8, b)
+	return w.pushBits(8, b)
 }
 
-func (e *Encoder) pushBits(count uint8, bits byte) error {
+func (w *Writer) pushBits(count uint8, bits byte) error {
 	l("++ push_bits: %d bits, input of 0x%02x\n", count, bits)
-	if count == 8 && e.bitIndex == 0x80 {
-		err := e.w.WriteByte(bits)
+	if count == 8 && w.bitIndex == 0x80 {
+		err := w.w.WriteByte(bits)
 		if err == nil {
-			e.outputTotal++
+			w.outputTotal++
 		}
 		return err
 	}
@@ -424,81 +412,80 @@ func (e *Encoder) pushBits(count uint8, bits byte) error {
 	for i = int16(count) - 1; i >= 0; i-- {
 		bit := bits & (1 << uint16(i))
 		if bit > 0 {
-			e.current |= e.bitIndex
-			l("  -- setting bit %d at bit index 0x%02x, byte => 0x%02x\n", 1, e.bitIndex, e.current)
+			w.current |= w.bitIndex
+			l("  -- setting bit %d at bit index 0x%02x, byte => 0x%02x\n", 1, w.bitIndex, w.current)
 		} else {
-			l("  -- setting bit %d at bit index 0x%02x, byte => 0x%02x\n", 0, e.bitIndex, e.current)
+			l("  -- setting bit %d at bit index 0x%02x, byte => 0x%02x\n", 0, w.bitIndex, w.current)
 		}
-		e.bitIndex >>= 1
-		if e.bitIndex == 0 {
-			e.bitIndex = 0x80
-			l(" > pushing byte 0x%02x\n", e.current)
-			err = e.w.WriteByte(e.current)
+		w.bitIndex >>= 1
+		if w.bitIndex == 0 {
+			w.bitIndex = 0x80
+			l(" > pushing byte 0x%02x\n", w.current)
+			err = w.w.WriteByte(w.current)
 			if err != nil {
 				return err
 			}
-			e.outputTotal++
-			e.current = 0x0
+			w.outputTotal++
+			w.current = 0x0
 		}
 	}
 	return nil
 }
 
-func (e *Encoder) pushOutgoingBits() (uint8, error) {
+func (w *Writer) pushOutgoingBits() (uint8, error) {
 	var count uint8
 	var bits byte
-	if e.outgoingBitsCount > 8 {
+	if w.outgoingBitsCount > 8 {
 		count = 8
-		bits = byte(e.outgoingBits >> (e.outgoingBitsCount - 8))
+		bits = byte(w.outgoingBits >> (w.outgoingBitsCount - 8))
 	} else {
-		count = e.outgoingBitsCount
-		bits = byte(e.outgoingBits)
+		count = w.outgoingBitsCount
+		bits = byte(w.outgoingBits)
 	}
 	if count > 0 {
 		l("-- pushing %d outgoing bits: 0x%02x\n", count, bits)
-		err := e.pushBits(count, bits)
+		err := w.pushBits(count, bits)
 		if err != nil {
 			return 0, err
 		}
-		e.outgoingBitsCount -= count
+		w.outgoingBitsCount -= count
 	}
 	return count, nil
 }
 
-func (e *Encoder) addTagBit(tag byte) error {
+func (w *Writer) addTagBit(tag byte) error {
 	l("-- adding tag bit: %d\n", tag)
-	return e.pushBits(1, tag)
+	return w.pushBits(1, tag)
 }
 
-func (e *Encoder) saveBacklog() {
-	msi := e.matchScanIndex
-	copy(e.buffer, e.buffer[msi:])
-	e.matchScanIndex = 0
-	e.inputSize -= msi
+func (w *Writer) saveBacklog() {
+	msi := w.matchScanIndex
+	copy(w.buffer, w.buffer[msi:])
+	w.matchScanIndex = 0
+	w.inputSize -= msi
 }
 
-func (e *Encoder) getInputBufferSize() int {
-	return 1 << e.window
+func (w *Writer) getInputBufferSize() int {
+	return 1 << w.window
 }
 
-func (e *Encoder) doIndexing() {
+func (w *Writer) doIndexing() {
 	var last [256]int16
 	for i := range last {
 		last[i] = -1
 	}
-	ibs := e.getInputBufferSize()
-	end := ibs + e.inputSize
+	ibs := w.getInputBufferSize()
+	end := ibs + w.inputSize
 	var i int
 	for i = 0; i < end; i++ {
-		v := e.buffer[i]
+		v := w.buffer[i]
 		lv := last[v]
 		l("-- setting index: %d, v: %d lv: %d\n", i, v, lv)
-		e.index[i] = lv
+		w.index[i] = lv
 		last[v] = int16(i)
 	}
 }
 
-func (e *Encoder) isFinishing() bool {
-	return e.flags&encodeFlagsFinishing == encodeFlagsFinishing
+func (w *Writer) isFinishing() bool {
+	return w.flags&encodeFlagsFinishing == encodeFlagsFinishing
 }
-
