@@ -276,15 +276,7 @@ func (r *Reader) finish() bool {
 	return false
 }
 
-func isPrint(b byte) bool {
-	return b > 0x1f && b != 0x7f
-}
-
 func (r *Reader) push(b byte) {
 	r.outputBuffer[r.outputIndex] = b
 	r.outputIndex++
-}
-
-func l(format string, v ...interface{}) {
-	//log.Printf(format, v...)
 }
