@@ -15,4 +15,5 @@ const (
 	encodeStateSaveBacklog
 	encodeStateFlushBits
 	encodeStateDone
+	encodeStateInvalid
 )

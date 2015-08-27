@@ -1,27 +1,31 @@
 package goheatshrink
 
 import (
-	"testing"
-	"crypto/rand"
-	"log"
 	"bytes"
+	"crypto/rand"
 	"io/ioutil"
+	"log"
+	"testing"
+	"time"
 )
 
-
 func Test(t *testing.T) {
-	testdata := make([]byte, 3760)
+	testdata := make([]byte, 1 << 16)
 	rand.Read(testdata)
-	e := NewEncoder(8, 4)
 	log.Printf("Encoding...")
-	encoded, err := e.Encode(testdata)
+	w := bytes.NewBuffer(testdata)
+	var encoded bytes.Buffer
+	e := NewWriter(&encoded, 8, 4)
+	_, err := w.WriteTo(e)
 	if err != nil {
 		t.Errorf("Error encoding: %v", err)
 	}
-	r := bytes.NewBuffer(encoded)
+	r := bytes.NewBuffer(encoded.Bytes())
 	d := NewReader(r, 8, 4)
 	log.Printf("Decoding...")
+	start := time.Now()
 	decoded, err := ioutil.ReadAll(d)
+	log.Printf("Decoded %v", time.Since(start))
 	if err != nil {
 		t.Errorf("Error decoding: %v", err)
 	}
