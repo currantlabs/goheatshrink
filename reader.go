@@ -1,13 +1,20 @@
 package goheatshrink
 
 import (
-	"errors"
 	"io"
 	"log"
 )
 
-type Reader struct {
-	reader    io.Reader
+// Resetter resets a io.Reader returned by NewReader to switch to a new underlying io.Reader.
+// This permits reusing a io.Reader instead of allocating a new one.
+type Resetter interface {
+	// Reset discards any buffered data and resets the Resetter as if it was
+	// newly initialized with the given reader.
+	Reset(r io.Reader) error
+}
+
+type reader struct {
+	inner     io.Reader
 	window    uint8
 	lookahead uint8
 
@@ -24,28 +31,49 @@ type Reader struct {
 	windowBuffer []byte
 	bufferSize   int
 
-	outputBuffer       []byte
 	outputCount        int
-	outputSize         int
-	outputIndex        int
 	outputBackRefIndex int
 }
 
-var errNoBitsAvailable = errors.New("no available bits")
-var errOutputBufferFull = errors.New("output buffer full")
+type decodeState int
 
-func NewReader(reader io.Reader, window uint8, lookahead uint8) *Reader {
-	return &Reader{
-		reader:       reader,
-		window:       window,
-		lookahead:    lookahead,
+const (
+	decodeStateTagBit decodeState = iota
+	decodeStateYieldLiteral
+	decodeStateBackRefIndexMSB
+	decodeStateBackRefIndexLSB
+	decodeStateBackRefCountMSB
+	decodeStateBackRefCountLSB
+	decodeStateYieldBackRef
+)
+
+// NewReader creates a new Reader reading the given io.Reader.
+//
+// The Reader returned by NewReader also implements Resetter.
+func NewReader(r io.Reader) io.Reader {
+	return NewReaderConfig(r, DefaultConfig)
+}
+
+// NewReaderConfig creates a new Reader reading the given io.Reader.
+//
+// config specifies the configuration values to use when decompressing
+//
+// The Reader returned by NewReader also implements Resetter.
+func NewReaderConfig(r io.Reader, config *Config) io.Reader {
+	return &reader{
+		inner:        r,
+		window:       config.Window,
+		lookahead:    config.Lookahead,
 		state:        decodeStateTagBit,
-		windowBuffer: make([]byte, 1<<window),
-		inputBuffer:  make([]byte, 1<<window),
+		windowBuffer: make([]byte, 1<<config.Window),
+		inputBuffer:  make([]byte, 1<<config.Window),
 	}
 }
 
-func (r *Reader) Read(out []byte) (int, error) {
+func (r *reader) Read(out []byte) (int, error) {
+	if len(out) == 0 {
+		return 0, nil
+	}
 	var in []byte
 	if r.inputSize > 0 {
 		// Still have leftover bytes from last read
@@ -53,39 +81,83 @@ func (r *Reader) Read(out []byte) (int, error) {
 	} else {
 		in = r.inputBuffer
 	}
-	incount, err := r.reader.Read(in)
-	r.inputSize += incount
+	count, err := r.inner.Read(in)
+	r.inputSize += count
 	if r.inputSize > 0 {
 		return r.decodeRead(r.inputBuffer[:r.inputSize], out)
-	} else if err == io.EOF && r.finish() {
-		return 0, io.EOF
+	} else if err != nil {
+		if err == io.EOF {
+			if r.finish() {
+				return 0, io.EOF
+			}
+			return 0, ErrTruncated
+		}
+		return 0, err
 	}
-	return 0, errors.New("Ran out of input before finishing")
+	return 0, ErrBadReader
 }
 
-func (r *Reader) decodeRead(in []byte, out []byte) (int, error) {
+// Reset clears the state of the Reader r such that it is equivalent to its initial state
+func (r *reader) Reset(new io.Reader) {
+	for i := range r.buffer {
+		r.buffer[i] = 0
+	}
+	for i := range r.windowBuffer {
+		r.windowBuffer[i] = 0
+	}
+	for i := range r.inputBuffer {
+		r.inputBuffer[i] = 0
+	}
+	r.state = decodeStateTagBit
+	r.inputIndex = 0
+	r.inputSize = 0
+	r.bitIndex = 0
+	r.current = 0x0
+	r.outputCount = 0
+	r.outputBackRefIndex = 0
+	r.headIndex = 0
+	r.inner = new
+}
+
+type output struct {
+	buf   []byte
+	size  int
+	index int
+}
+
+func (o *output) push(b byte) {
+	o.buf[o.index] = b
+	o.index++
+}
+
+func (r *reader) decodeRead(in []byte, out []byte) (int, error) {
 	totalout := 0
 	r.buffer = in
 	r.inputSize = len(in)
-	r.outputBuffer = out
-	r.outputSize = len(out)
-	r.outputIndex = 0
+
+	o := &output{
+		buf:   out,
+		size:  len(out),
+		index: 0,
+	}
 	for {
-		outputSize, err := r.poll()
+		outputSize, err := r.poll(o)
 		totalout += outputSize
 		if err == errOutputBufferFull {
-			return totalout, errOutputBufferFull
+			return totalout, nil
+		} else if err != nil {
+			return totalout, err
 		}
 		if r.finish() {
 			return totalout, nil
 		}
 	}
-	return totalout, errors.New("Ran out of input before finishing")
+	return totalout, ErrTruncated
 }
 
-func (r *Reader) poll() (int, error) {
+func (r *reader) poll(o *output) (int, error) {
 
-	r.outputIndex = 0
+	o.index = 0
 
 	for {
 		state := r.state
@@ -93,7 +165,7 @@ func (r *Reader) poll() (int, error) {
 		case decodeStateTagBit:
 			r.state = r.stateTagBit()
 		case decodeStateYieldLiteral:
-			r.state = r.stateYieldLiteral()
+			r.state = r.stateYieldLiteral(o)
 		case decodeStateBackRefIndexMSB:
 			r.state = r.stateBackRefIndexMSB()
 		case decodeStateBackRefIndexLSB:
@@ -103,20 +175,20 @@ func (r *Reader) poll() (int, error) {
 		case decodeStateBackRefCountLSB:
 			r.state = r.stateBackRefCountLSB()
 		case decodeStateYieldBackRef:
-			r.state = r.stateYieldBackRef()
+			r.state = r.stateYieldBackRef(o)
 		default:
 			log.Fatal("Unknown state: %v", state)
 		}
 		if r.state == state {
-			if r.outputIndex == cap(r.outputBuffer) {
-				return r.outputIndex, errOutputBufferFull
+			if o.index == cap(o.buf) {
+				return o.index, errOutputBufferFull
 			}
-			return r.outputIndex, nil
+			return o.index, nil
 		}
 	}
 }
 
-func (r *Reader) stateTagBit() decodeState {
+func (r *reader) stateTagBit() decodeState {
 	bits, err := r.getBits(1)
 	if err == errNoBitsAvailable {
 		return decodeStateTagBit
@@ -131,8 +203,8 @@ func (r *Reader) stateTagBit() decodeState {
 	return decodeStateBackRefIndexLSB
 }
 
-func (r *Reader) stateYieldLiteral() decodeState {
-	if r.outputIndex < r.outputSize {
+func (r *reader) stateYieldLiteral(o *output) decodeState {
+	if o.index < o.size {
 		bits, err := r.getBits(8)
 		if err == errNoBitsAvailable {
 			return decodeStateYieldLiteral
@@ -141,13 +213,13 @@ func (r *Reader) stateYieldLiteral() decodeState {
 		c := byte(bits & 0xFF)
 		r.windowBuffer[uint16(r.headIndex)&mask] = c
 		r.headIndex++
-		r.push(c)
+		o.push(c)
 		return decodeStateTagBit
 	}
 	return decodeStateYieldLiteral
 }
 
-func (r *Reader) stateBackRefIndexMSB() decodeState {
+func (r *reader) stateBackRefIndexMSB() decodeState {
 	bitCount := r.window
 	bits, err := r.getBits(bitCount - 8)
 	if err == errNoBitsAvailable {
@@ -157,7 +229,7 @@ func (r *Reader) stateBackRefIndexMSB() decodeState {
 	return decodeStateBackRefIndexLSB
 }
 
-func (r *Reader) stateBackRefIndexLSB() decodeState {
+func (r *reader) stateBackRefIndexLSB() decodeState {
 	bitCount := r.window
 	var bits uint16
 	var err error
@@ -179,7 +251,7 @@ func (r *Reader) stateBackRefIndexLSB() decodeState {
 	return decodeStateBackRefCountLSB
 }
 
-func (r *Reader) stateBackRefCountMSB() decodeState {
+func (r *reader) stateBackRefCountMSB() decodeState {
 	backRefBitCount := r.lookahead
 	bits, err := r.getBits(backRefBitCount - 8)
 	if err == errNoBitsAvailable {
@@ -189,7 +261,7 @@ func (r *Reader) stateBackRefCountMSB() decodeState {
 	return decodeStateBackRefCountLSB
 }
 
-func (r *Reader) stateBackRefCountLSB() decodeState {
+func (r *reader) stateBackRefCountLSB() decodeState {
 	backRefBitCount := r.lookahead
 	var bits uint16
 	var err error
@@ -206,8 +278,8 @@ func (r *Reader) stateBackRefCountLSB() decodeState {
 	return decodeStateYieldBackRef
 }
 
-func (r *Reader) stateYieldBackRef() decodeState {
-	count := r.outputSize - r.outputIndex
+func (r *reader) stateYieldBackRef(o *output) decodeState {
+	count := o.size - o.index
 	if count > 0 {
 		if r.outputCount < count {
 			count = r.outputCount
@@ -217,7 +289,7 @@ func (r *Reader) stateYieldBackRef() decodeState {
 		negOffset := r.outputBackRefIndex
 		for i := 0; i < count; i++ {
 			c := r.windowBuffer[(r.headIndex-negOffset)&mask]
-			r.push(c)
+			o.push(c)
 			r.windowBuffer[r.headIndex&mask] = c
 			r.headIndex++
 		}
@@ -229,7 +301,7 @@ func (r *Reader) stateYieldBackRef() decodeState {
 	return decodeStateYieldBackRef
 }
 
-func (r *Reader) getBits(count uint8) (uint16, error) {
+func (r *reader) getBits(count uint8) (uint16, error) {
 	var accumulator uint16
 
 	if count > 15 {
@@ -263,7 +335,7 @@ func (r *Reader) getBits(count uint8) (uint16, error) {
 	return accumulator, nil
 }
 
-func (r *Reader) finish() bool {
+func (r *reader) finish() bool {
 	switch r.state {
 	case decodeStateTagBit, decodeStateBackRefIndexLSB, decodeStateBackRefIndexMSB, decodeStateBackRefCountLSB, decodeStateBackRefCountMSB, decodeStateYieldLiteral:
 		if r.inputSize == 0 {
@@ -274,9 +346,4 @@ func (r *Reader) finish() bool {
 		return false
 	}
 	return false
-}
-
-func (r *Reader) push(b byte) {
-	r.outputBuffer[r.outputIndex] = b
-	r.outputIndex++
 }

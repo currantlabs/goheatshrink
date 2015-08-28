@@ -7,12 +7,7 @@ import (
 	"log"
 )
 
-type writer interface {
-	io.ByteWriter
-	Flush() error
-}
-
-type Writer struct {
+type writer struct {
 	inputSize         int
 	matchScanIndex    int
 	matchLength       int
@@ -29,32 +24,72 @@ type Writer struct {
 	lookahead uint8
 	index     []int16
 
-	w           writer
+	inner       inner
 	outputTotal int
 }
+
+type inner interface {
+	io.ByteWriter
+	Flush() error
+}
+
+type encodeFlags int
+
+const (
+	encodeFlagsNone      encodeFlags = 0
+	encodeFlagsFinishing             = 1
+)
+
+type encodeState int
+
+const (
+	encodeStateNotFull encodeState = iota
+	encodeStateFilled
+	encodeStateSearch
+	encodeStateYieldTagBit
+	encodeStateYieldLiteral
+	encodeStateYieldBackRefIndex
+	encodeStateYieldBackRefLength
+	encodeStateSaveBacklog
+	encodeStateFlushBits
+	encodeStateDone
+	encodeStateInvalid
+)
 
 const heatshrinkLiteralMarker byte = 0x01
 const heatshrinkBackrefMarker byte = 0x00
 
-func NewWriter(w io.Writer, window uint8, lookahead uint8) *Writer {
-	bufSize := 2 << window
-	bw, ok := w.(writer)
+// NewWriter creates a new io.WriteCloser. Writes to the returned io.WriteCloser are compressed and written to w.
+//
+// It is the caller's responsibility to call Close on the io.WriteCloser when done. Writes may be buffered and not flushed until Close.
+func NewWriter(w io.Writer, window uint8) io.WriteCloser {
+	return NewWriterConfig(w, DefaultConfig)
+}
+
+// NewWriterConfig creates a new io.WriteCloser. Writes to the returned io.WriteCloser are compressed and written to w.
+//
+// config specifies the configuration values to use when compressing
+//
+// It is the caller's responsibility to call Close on the io.WriteCloser when done. Writes may be buffered and not flushed until Close.
+func NewWriterConfig(w io.Writer, config *Config) io.WriteCloser {
+	bufSize := 2 << config.Window
+	bw, ok := w.(inner)
 	if !ok {
 		bw = bufio.NewWriter(w)
 	}
-	return &Writer{
-		w:        bw,
+	return &writer{
+		inner:    bw,
 		state:    encodeStateNotFull,
 		bitIndex: 0x80,
 
-		window:    window,
-		lookahead: lookahead,
+		window:    config.Window,
+		lookahead: config.Lookahead,
 		buffer:    make([]byte, bufSize),
 		index:     make([]int16, bufSize),
 	}
 }
 
-func (w *Writer) Write(p []byte) (n int, err error) {
+func (w *writer) Write(p []byte) (n int, err error) {
 	var done int
 	total := len(p)
 	for {
@@ -67,7 +102,7 @@ func (w *Writer) Write(p []byte) (n int, err error) {
 			p = p[inputSize:]
 		}
 
-		outputSize, err, notFull := w.poll()
+		outputSize, notFull, err := w.poll()
 		if err != nil {
 			return done, err
 		}
@@ -87,21 +122,30 @@ func (w *Writer) Write(p []byte) (n int, err error) {
 	return done, nil
 }
 
-func (w *Writer) Close() error {
+func (w *writer) Close() error {
+	var err error
 	if w.finish() {
+		err = w.inner.Flush()
+		if err != nil {
+			return err
+		}
 		return nil
 	}
-	_, err, _ := w.poll()
+	_, _, err = w.poll()
 	if err != nil {
 		return err
 	}
 	if w.finish() {
+		err = w.inner.Flush()
+		if err != nil {
+			return err
+		}
 		return nil
 	}
-	return errors.New("unable to finish")
+	return ErrBadStateOnClose
 }
 
-func (w *Writer) sink(in []byte) (int, error) {
+func (w *writer) sink(in []byte) (int, error) {
 	if w.isFinishing() {
 		return 0, errors.New("sinking while finishing")
 	}
@@ -125,7 +169,7 @@ func (w *Writer) sink(in []byte) (int, error) {
 	return copySize, nil
 }
 
-func (w *Writer) poll() (int, error, bool) {
+func (w *writer) poll() (int, bool, error) {
 
 	w.outputTotal = 0
 	var err error
@@ -134,7 +178,7 @@ func (w *Writer) poll() (int, error, bool) {
 		state := w.state
 		switch state {
 		case encodeStateNotFull:
-			return w.outputTotal, nil, true
+			return w.outputTotal, true, nil
 		case encodeStateFilled:
 			w.doIndexing()
 			w.state = encodeStateSearch
@@ -153,21 +197,21 @@ func (w *Writer) poll() (int, error, bool) {
 		case encodeStateFlushBits:
 			w.state, err = w.stateFlushBitBuffer()
 		case encodeStateDone:
-			return w.outputTotal, nil, false
+			return w.outputTotal, false, nil
 		case encodeStateInvalid:
 			log.Fatal("Invalid state: %v", state)
 		default:
 			log.Fatal("Unknown state: %v", state)
 		}
 		if err != nil {
-			return w.outputTotal, err, false
+			return w.outputTotal, false, err
 		}
 
 	}
 
 }
 
-func (w *Writer) finish() bool {
+func (w *writer) finish() bool {
 	w.flags |= encodeFlagsFinishing
 	if w.state == encodeStateNotFull {
 		w.state = encodeStateFilled
@@ -175,9 +219,9 @@ func (w *Writer) finish() bool {
 	return w.state == encodeStateDone
 }
 
-func (w *Writer) stateStepSearch() encodeState {
-	var windowLength int = 1 << w.window
-	var lookaheadLength int = 1 << w.lookahead
+func (w *writer) stateStepSearch() encodeState {
+	windowLength := 1 << w.window
+	lookaheadLength := 1 << w.lookahead
 	msi := w.matchScanIndex
 	fin := w.isFinishing()
 	var lookaheadCompare int
@@ -212,7 +256,7 @@ func (w *Writer) stateStepSearch() encodeState {
 	return encodeStateYieldTagBit
 }
 
-func (w *Writer) stateYieldTagBit() (encodeState, error) {
+func (w *writer) stateYieldTagBit() (encodeState, error) {
 	if w.matchLength == 0 {
 		err := w.addTagBit(heatshrinkLiteralMarker)
 		if err != nil {
@@ -229,7 +273,7 @@ func (w *Writer) stateYieldTagBit() (encodeState, error) {
 	return encodeStateYieldBackRefIndex, nil
 }
 
-func (w *Writer) stateYieldLiteral() (encodeState, error) {
+func (w *writer) stateYieldLiteral() (encodeState, error) {
 	err := w.pushLiteralByte()
 	if err != nil {
 		return encodeStateInvalid, err
@@ -237,7 +281,7 @@ func (w *Writer) stateYieldLiteral() (encodeState, error) {
 	return encodeStateSearch, nil
 }
 
-func (w *Writer) stateYieldBackRefIndex() (encodeState, error) {
+func (w *writer) stateYieldBackRefIndex() (encodeState, error) {
 	count, err := w.pushOutgoingBits()
 	if err != nil {
 		return encodeStateInvalid, err
@@ -250,7 +294,7 @@ func (w *Writer) stateYieldBackRefIndex() (encodeState, error) {
 	return encodeStateYieldBackRefLength, nil
 }
 
-func (w *Writer) stateYieldBackRefLength() (encodeState, error) {
+func (w *writer) stateYieldBackRefLength() (encodeState, error) {
 	count, err := w.pushOutgoingBits()
 	if err != nil {
 		return encodeStateInvalid, err
@@ -263,16 +307,16 @@ func (w *Writer) stateYieldBackRefLength() (encodeState, error) {
 	return encodeStateSearch, nil
 }
 
-func (w *Writer) stateSaveBacklog() encodeState {
+func (w *writer) stateSaveBacklog() encodeState {
 	w.saveBacklog()
 	return encodeStateNotFull
 }
 
-func (w *Writer) stateFlushBitBuffer() (encodeState, error) {
+func (w *writer) stateFlushBitBuffer() (encodeState, error) {
 	if w.bitIndex == 0x80 {
 		return encodeStateDone, nil
 	}
-	err := w.w.WriteByte(w.current)
+	err := w.inner.WriteByte(w.current)
 	if err != nil {
 		return encodeStateInvalid, err
 	}
@@ -282,7 +326,7 @@ func (w *Writer) stateFlushBitBuffer() (encodeState, error) {
 
 const matchNotFound = ^int(0)
 
-func (w *Writer) findLongestMatch(start int, end int, max int) (int, int) {
+func (w *writer) findLongestMatch(start int, end int, max int) (int, int) {
 	var matchMaxLength int
 	var matchIndex = matchNotFound
 	var len int
@@ -317,7 +361,7 @@ func (w *Writer) findLongestMatch(start int, end int, max int) (int, int) {
 	return matchNotFound, 0
 }
 
-func (w *Writer) pushLiteralByte() error {
+func (w *writer) pushLiteralByte() error {
 	processedOffset := w.matchScanIndex - 1
 	inputOffset := w.getInputBufferSize() + processedOffset
 
@@ -325,9 +369,9 @@ func (w *Writer) pushLiteralByte() error {
 	return w.pushBits(8, b)
 }
 
-func (w *Writer) pushBits(count uint8, bits byte) error {
+func (w *writer) pushBits(count uint8, bits byte) error {
 	if count == 8 && w.bitIndex == 0x80 {
-		err := w.w.WriteByte(bits)
+		err := w.inner.WriteByte(bits)
 		if err == nil {
 			w.outputTotal++
 		}
@@ -343,7 +387,7 @@ func (w *Writer) pushBits(count uint8, bits byte) error {
 		w.bitIndex >>= 1
 		if w.bitIndex == 0 {
 			w.bitIndex = 0x80
-			err = w.w.WriteByte(w.current)
+			err = w.inner.WriteByte(w.current)
 			if err != nil {
 				return err
 			}
@@ -354,7 +398,7 @@ func (w *Writer) pushBits(count uint8, bits byte) error {
 	return nil
 }
 
-func (w *Writer) pushOutgoingBits() (uint8, error) {
+func (w *writer) pushOutgoingBits() (uint8, error) {
 	var count uint8
 	var bits byte
 	if w.outgoingBitsCount > 8 {
@@ -374,22 +418,22 @@ func (w *Writer) pushOutgoingBits() (uint8, error) {
 	return count, nil
 }
 
-func (w *Writer) addTagBit(tag byte) error {
+func (w *writer) addTagBit(tag byte) error {
 	return w.pushBits(1, tag)
 }
 
-func (w *Writer) saveBacklog() {
+func (w *writer) saveBacklog() {
 	msi := w.matchScanIndex
 	copy(w.buffer, w.buffer[msi:])
 	w.matchScanIndex = 0
 	w.inputSize -= msi
 }
 
-func (w *Writer) getInputBufferSize() int {
+func (w *writer) getInputBufferSize() int {
 	return 1 << w.window
 }
 
-func (w *Writer) doIndexing() {
+func (w *writer) doIndexing() {
 	var last [256]int16
 	for i := range last {
 		last[i] = -1
@@ -405,6 +449,6 @@ func (w *Writer) doIndexing() {
 	}
 }
 
-func (w *Writer) isFinishing() bool {
+func (w *writer) isFinishing() bool {
 	return w.flags&encodeFlagsFinishing == encodeFlagsFinishing
 }
