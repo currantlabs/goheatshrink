@@ -1,6 +1,6 @@
 # goheatshrink
 
-A port of the [heatshrink](http://travis-ci.org/atomicobject/heatshrink) embedded compression library to Go
+A port of the [heatshrink](https://github.com/atomicobject/heatshrink) embedded compression library to Go
 
 ## Examples
 
@@ -54,3 +54,7 @@ func main() {
     io.Copy(out, r)
 }
 ```
+
+## Build Status
+
+  [![Build Status](https://travis-ci.org/currantlabs/goheatshrink.png)](http://travis-ci.org/currantlabs/goheatshrink)
