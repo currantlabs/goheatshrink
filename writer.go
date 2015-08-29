@@ -102,9 +102,16 @@ func (w *writer) Write(p []byte) (n int, err error) {
 			p = p[inputSize:]
 		}
 
-		outputSize, notFull, err := w.poll()
+		outputSize, err := w.poll()
 		if err != nil {
 			return done, err
+		}
+		if done >= total {
+			break
+		}
+
+		if w.state == encodeStateNotFull {
+			continue
 		}
 
 		if outputSize == 0 {
@@ -112,12 +119,7 @@ func (w *writer) Write(p []byte) (n int, err error) {
 				return done, nil
 			}
 		}
-		if notFull {
-			continue
-		}
-		if done >= total {
-			break
-		}
+
 	}
 	return done, nil
 }
@@ -131,7 +133,7 @@ func (w *writer) Close() error {
 		}
 		return nil
 	}
-	_, _, err = w.poll()
+	_, err = w.poll()
 	if err != nil {
 		return err
 	}
@@ -169,7 +171,7 @@ func (w *writer) sink(in []byte) (int, error) {
 	return copySize, nil
 }
 
-func (w *writer) poll() (int, bool, error) {
+func (w *writer) poll() (int, error) {
 
 	w.outputTotal = 0
 	var err error
@@ -178,7 +180,7 @@ func (w *writer) poll() (int, bool, error) {
 		state := w.state
 		switch state {
 		case encodeStateNotFull:
-			return w.outputTotal, true, nil
+			return w.outputTotal, nil
 		case encodeStateFilled:
 			w.doIndexing()
 			w.state = encodeStateSearch
@@ -197,14 +199,14 @@ func (w *writer) poll() (int, bool, error) {
 		case encodeStateFlushBits:
 			w.state, err = w.stateFlushBitBuffer()
 		case encodeStateDone:
-			return w.outputTotal, false, nil
+			return w.outputTotal, nil
 		case encodeStateInvalid:
 			log.Fatal("Invalid state: %v", state)
 		default:
 			log.Fatal("Unknown state: %v", state)
 		}
 		if err != nil {
-			return w.outputTotal, false, err
+			return w.outputTotal, err
 		}
 
 	}
