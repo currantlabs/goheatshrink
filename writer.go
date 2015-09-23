@@ -62,7 +62,7 @@ const heatshrinkBackrefMarker byte = 0x00
 // NewWriter creates a new io.WriteCloser. Writes to the returned io.WriteCloser are compressed and written to w.
 //
 // It is the caller's responsibility to call Close on the io.WriteCloser when done. Writes may be buffered and not flushed until Close.
-func NewWriter(w io.Writer, window uint8) io.WriteCloser {
+func NewWriter(w io.Writer) io.WriteCloser {
 	return NewWriterConfig(w, DefaultConfig)
 }
 
