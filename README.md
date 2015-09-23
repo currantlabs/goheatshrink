@@ -17,10 +17,10 @@ import (
 )
 
 func main() {
-    in, _ = os.Open("bigfile.bin")
+    in, _ := os.Open("bigfile.bin")
     defer in.Close()
 
-    out, _ = os.Create("bigfile.bin.hz")
+    out, _ := os.Create("bigfile.bin.hz")
     defer out.Close()
 
     w := goheatshrink.NewWriter(out)
@@ -43,10 +43,10 @@ import (
 )
 
 func main() {
-    in, _ = os.Open("bigfile.bin.hz")
+    in, _ := os.Open("bigfile.bin.hz")
     defer in.Close()
 
-    out, _ = os.Create("bigfile.bin")
+    out, _ := os.Create("bigfile.bin")
     defer out.Close()
 
     r := goheatshrink.NewReader(in)
