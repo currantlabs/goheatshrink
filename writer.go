@@ -8,6 +8,8 @@ import (
 )
 
 type writer struct {
+	*config
+
 	inputSize         int
 	matchScanIndex    int
 	matchLength       int
@@ -20,8 +22,6 @@ type writer struct {
 	bitIndex          uint8
 
 	buffer    []byte
-	window    uint8
-	lookahead uint8
 	index     []int16
 
 	inner       inner
@@ -59,34 +59,29 @@ const (
 const heatshrinkLiteralMarker byte = 0x01
 const heatshrinkBackrefMarker byte = 0x00
 
-// NewWriter creates a new io.WriteCloser. Writes to the returned io.WriteCloser are compressed and written to w.
-//
-// It is the caller's responsibility to call Close on the io.WriteCloser when done. Writes may be buffered and not flushed until Close.
-func NewWriter(w io.Writer) io.WriteCloser {
-	return NewWriterConfig(w, DefaultConfig)
-}
-
 // NewWriterConfig creates a new io.WriteCloser. Writes to the returned io.WriteCloser are compressed and written to w.
 //
 // config specifies the configuration values to use when compressing
 //
 // It is the caller's responsibility to call Close on the io.WriteCloser when done. Writes may be buffered and not flushed until Close.
-func NewWriterConfig(w io.Writer, config *Config) io.WriteCloser {
-	bufSize := 2 << config.Window
+func NewWriter(w io.Writer, options ...func(*config)) io.WriteCloser {
+	hw := &writer{
+		config: &config{window:defaultWindow, lookahead:defaultLookahead},
+		state: encodeStateNotFull,
+		bitIndex: 0x80,
+	}
+	for _, option := range options {
+		option(hw.config)
+	}
+	bufSize := 2 << hw.window
 	bw, ok := w.(inner)
 	if !ok {
 		bw = bufio.NewWriter(w)
 	}
-	return &writer{
-		inner:    bw,
-		state:    encodeStateNotFull,
-		bitIndex: 0x80,
-
-		window:    config.Window,
-		lookahead: config.Lookahead,
-		buffer:    make([]byte, bufSize),
-		index:     make([]int16, bufSize),
-	}
+	hw.inner = bw
+	hw.buffer = make([]byte, bufSize)
+	hw.index = make([]int16, bufSize)
+	return hw
 }
 
 func (w *writer) Write(p []byte) (n int, err error) {

@@ -28,8 +28,6 @@ func main() {
 	kingpin.Version("0.1")
 	kingpin.Parse()
 
-	c := &goheatshrink.Config{Window: uint8(*window), Lookahead: uint8(*lookahead)}
-
 	var s counter
 	var writer io.WriteCloser
 	var reader io.Reader
@@ -70,7 +68,7 @@ func main() {
 			ir = rs
 		}
 		writer = out
-		reader = goheatshrink.NewReaderConfig(ir, c)
+		reader = goheatshrink.NewReader(ir, goheatshrink.Window(uint8(*window)), goheatshrink.Lookahead(uint8(*lookahead)))
 	} else if *encode {
 		var wc io.WriteCloser = out
 		if *verbose {
@@ -78,15 +76,15 @@ func main() {
 			s = ws
 			wc = ws
 		}
-		writer = goheatshrink.NewWriterConfig(wc, c)
+		writer = goheatshrink.NewWriter(wc, goheatshrink.Window(uint8(*window)), goheatshrink.Lookahead(uint8(*lookahead)))
 		reader = in
 	} else {
 		log.Fatal(errors.New("Must provide either encode or decode"))
 	}
-	process(reader, writer, reporter, *outFile, s, c)
+	process(reader, writer, reporter, *outFile, s, uint8(*window), uint8(*lookahead))
 }
 
-func process(in io.Reader, out io.WriteCloser, reporter *os.File, outFile string, s counter, c *goheatshrink.Config) {
+func process(in io.Reader, out io.WriteCloser, reporter *os.File, outFile string, s counter, w uint8, l uint8) {
 	n, err := io.Copy(out, in)
 	if err != nil {
 		log.Fatal(err)
@@ -98,7 +96,7 @@ func process(in io.Reader, out io.WriteCloser, reporter *os.File, outFile string
 	}
 
 	if reporter != nil {
-		reporter.WriteString(fmt.Sprintf("%s %0.2f%%\t %d -> %d (-w %d -l %d)\n", outFile, 100.0-(100.0*float64(s.Count()))/float64(n), n, s.Count(), c.Window, c.Lookahead))
+		reporter.WriteString(fmt.Sprintf("%s %0.2f%%\t %d -> %d (-w %d -l %d)\n", outFile, 100.0-(100.0*float64(s.Count()))/float64(n), n, s.Count(), w, l))
 	}
 
 }

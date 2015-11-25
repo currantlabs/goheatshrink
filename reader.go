@@ -5,18 +5,19 @@ import (
 	"log"
 )
 
-// Resetter resets a io.Reader returned by NewReader to switch to a new underlying io.Reader.
+// ReadResetter groups an io.Reader with a Reset method, which can switch to a new underlying io.Reader.
 // This permits reusing a io.Reader instead of allocating a new one.
-type Resetter interface {
+type ReadResetter interface {
+	io.Reader
 	// Reset discards any buffered data and resets the Resetter as if it was
 	// newly initialized with the given reader.
-	Reset(r io.Reader) error
+	Reset(r io.Reader)
 }
 
 type reader struct {
+	*config
+
 	inner     io.Reader
-	window    uint8
-	lookahead uint8
 
 	inputBuffer []byte
 	inputSize   int
@@ -47,27 +48,21 @@ const (
 	decodeStateYieldBackRef
 )
 
-// NewReader creates a new Reader reading the given io.Reader.
+// NewReaderConfig creates a new ReadResetter reading the given io.Reader.
 //
-// The Reader returned by NewReader also implements Resetter.
-func NewReader(r io.Reader) io.Reader {
-	return NewReaderConfig(r, DefaultConfig)
-}
-
-// NewReaderConfig creates a new Reader reading the given io.Reader.
-//
-// config specifies the configuration values to use when decompressing
-//
-// The Reader returned by NewReader also implements Resetter.
-func NewReaderConfig(r io.Reader, config *Config) io.Reader {
-	return &reader{
+// options modifies the default configuration values to use when decompressing
+func NewReader(r io.Reader, options ...func(*config)) ReadResetter {
+	hr := &reader{
+		config: &config{window:defaultWindow, lookahead:defaultLookahead},
 		inner:        r,
-		window:       config.Window,
-		lookahead:    config.Lookahead,
 		state:        decodeStateTagBit,
-		windowBuffer: make([]byte, 1<<config.Window),
-		inputBuffer:  make([]byte, 1<<config.Window),
 	}
+	for _, option := range options {
+		option(hr.config)
+	}
+	hr.windowBuffer = make([]byte, 1<<hr.window)
+	hr.inputBuffer = make([]byte, 1<<hr.window)
+	return hr;
 }
 
 func (r *reader) Read(out []byte) (int, error) {
@@ -94,7 +89,7 @@ func (r *reader) Read(out []byte) (int, error) {
 		}
 		return 0, err
 	}
-	return 0, ErrBadReader
+	return 0, nil
 }
 
 // Reset clears the state of the Reader r such that it is equivalent to its initial state
