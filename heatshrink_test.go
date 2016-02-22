@@ -108,7 +108,7 @@ func testRoundTripTinyBuffers(t testing.TB, testdata []byte, window uint8, looka
 func compress(in []byte, window uint8, lookahead uint8) ([]byte, error) {
 	w := bytes.NewBuffer(in)
 	var encoded bytes.Buffer
-	e := NewWriterConfig(&encoded, &Config{Window: window, Lookahead: lookahead})
+	e := NewWriter(&encoded, Window(window), Lookahead(lookahead))
 	_, err := io.Copy(e, w)
 	e.Close()
 	if err != nil {
@@ -119,7 +119,7 @@ func compress(in []byte, window uint8, lookahead uint8) ([]byte, error) {
 
 func compressTinyBuffers(in []byte, window uint8, lookahead uint8) ([]byte, error) {
 	var encoded bytes.Buffer
-	e := NewWriterConfig(&encoded, &Config{Window: window, Lookahead: lookahead})
+	e := NewWriter(&encoded, Window(window), Lookahead(lookahead))
 	total := 0
 	for i := 0; i < len(in); i++ {
 		n, err := e.Write(in[i : i+1])
@@ -135,7 +135,7 @@ func compressTinyBuffers(in []byte, window uint8, lookahead uint8) ([]byte, erro
 
 func decompress(in []byte, window uint8, lookahead uint8) ([]byte, error) {
 	r := bytes.NewBuffer(in)
-	d := NewReaderConfig(r, &Config{Window: window, Lookahead: lookahead})
+	d := NewReader(r, Window(window), Lookahead(lookahead))
 	decoded, err := ioutil.ReadAll(d)
 	if err != nil {
 		return nil, err
